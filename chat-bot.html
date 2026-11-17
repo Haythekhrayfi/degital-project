@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chat</title>
+<style>
+:root{--bg:#f7f7f5;--panel:#fff;--text:#1a1a1a;--muted:#6b6b6b;--user:#2b6cb0;--bot:#eceae4;--border:#dedbd3;--accent:#2b6cb0;--err:#c53030}
+@media (prefers-color-scheme: dark){:root{--bg:#1c1c1e;--panel:#262628;--text:#eee;--muted:#999;--user:#3b7dd8;--bot:#333336;--border:#3a3a3d;--accent:#3b7dd8;--err:#f08080}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:var(--bg);color:var(--text);display:flex;flex-direction:column}
+header{display:flex;align-items:center;gap:8px;padding:10px 16px;border-bottom:1px solid var(--border);background:var(--panel);flex-wrap:wrap}
+header h1{font-size:16px;margin:0;flex:1;min-width:60px}
+button,select{font:inherit;border:1px solid var(--border);background:var(--panel);color:var(--text);padding:6px 12px;border-radius:8px}
+button{cursor:pointer}
+button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+button:disabled{opacity:.5;cursor:default}
+#modelSelect{max-width:230px}
+#settings{display:none;padding:12px 16px;border-bottom:1px solid var(--border);background:var(--panel);gap:10px;flex-direction:column}
+#settings.open{display:flex}
+#settings label{font-size:13px;color:var(--muted);display:flex;flex-direction:column;gap:4px}
+#settings input,#settings select,#settings textarea{font:inherit;padding:8px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text)}
+#settings .row{display:flex;gap:8px;flex-wrap:wrap}
+#hint{font-size:13px;color:var(--muted)}
+#hint a{color:var(--accent)}
+#messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
+.msg{max-width:78%;padding:10px 14px;border-radius:14px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word}
+.user{align-self:flex-end;background:var(--user);color:#fff;border-bottom-right-radius:4px}
+.assistant{align-self:flex-start;background:var(--bot);border-bottom-left-radius:4px}
+.typing{align-self:flex-start;color:var(--muted);font-style:italic}
+.error{align-self:center;color:var(--err);font-size:14px;text-align:center;max-width:90%}
+.info{align-self:center;color:var(--muted);font-size:14px;text-align:center}
+.empty{margin:auto;color:var(--muted);text-align:center}
+form{display:flex;gap:8px;padding:12px;border-top:1px solid var(--border);background:var(--panel);align-items:flex-end}
+textarea#input{flex:1;resize:none;font:inherit;padding:10px;border-radius:10px;border:1px solid var(--border);background:var(--bg);color:var(--text);max-height:160px;line-height:1.4}
+</style>
+</head>
+<body>
+<header>
+  <h1>Chat</h1>
+  <select id="modelSelect" title="Model"></select>
+  <button id="settingsBtn" type="button">Settings</button>
+  <button id="clearBtn" type="button">Clear</button>
+</header>
+
+<div id="settings">
+  <label>Provider
+    <select id="provider">
+      <option value="groq">Groq (free)</option>
+      <option value="gemini">Google Gemini</option>
+      <option value="anthropic">Anthropic Claude</option>
+    </select>
+  </label>
+  <label>API key
+    <input id="apiKey" type="password" placeholder="Paste your API key" autocomplete="off">
+  </label>
+  <div id="hint"></div>
+  <label>System prompt (optional)
+    <textarea id="system" rows="2"></textarea>
+  </label>
+  <div class="row">
+    <button class="primary" id="saveBtn" type="button">Save</button>
+    <button id="refreshBtn" type="button">Load latest Groq models</button>
+  </div>
+</div>
+
+<div id="messages"></div>
+
+<form id="form">
+  <textarea id="input" rows="1" placeholder="Message… (Enter to send, Shift+Enter for a new line)"></textarea>
+  <button class="primary" id="sendBtn" type="submit">Send</button>
+</form>
+
+<script>
+const $ = id => document.getElementById(id);
+const SETTINGS_KEY = 'chatbot.settings.v2';
+const OLD_SETTINGS_KEY = 'chatbot.settings';
+const HISTORY_KEY = 'chatbot.history';
+
+// Starter model lists. For Groq you can pull the live list with "Load latest Groq models".
+const DEFAULT_MODELS = {
+  groq: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'openai/gpt-oss-120b', 'openai/gpt-oss-20b'],
+  gemini: ['gemini-flash-latest', 'gemini-flash-lite-latest'],
+  anthropic: ['claude-haiku-5-5', 'claude-sonnet-5-5']
+};
+
+const HINTS = {
+  groq: 'Free key: <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a>',
+  gemini: 'Free key: <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>',
+  anthropic: 'Paid key: <a href="https://console.anthropic.com/" target="_blank" rel="noopener">console.anthropic.com</a>'
+};
+
+let settings = { provider: 'groq', keys: {}, models: {}, lists: {}, system: '' };
+try {
+  const raw = localStorage.getItem(SETTINGS_KEY);
+  if (raw) Object.assign(settings, JSON.parse(raw));
+  else {
+    // Carry over a key saved by the previous version of this page.
+    const old = JSON.parse(localStorage.getItem(OLD_SETTINGS_KEY) || 'null');
+    if (old && old.apiKey && old.provider) settings.keys[old.provider] = old.apiKey;
+    if (old && old.system) settings.system = old.system;
+  }
+} catch {}
+
+let history = [];
+try { history = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); } catch {}
+
+let busy = false;
+let notices = [];
+let infos = [];
+let draftKeys = {};
+let draftProvider = settings.provider;
+
+function persist() {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
+}
+function saveHistory() {
+  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch {}
+}
+
+function modelList(p) { return settings.lists[p] || DEFAULT_MODELS[p]; }
+function currentModel() {
+  const p = settings.provider;
+  return settings.models[p] || modelList(p)[0];
+}
+
+function fillModelSelect() {
+  const sel = $('modelSelect');
+  const cur = currentModel();
+  const list = modelList(settings.provider).slice();
+  if (!list.includes(cur)) list.unshift(cur);
+  sel.innerHTML = '';
+  for (const m of list) {
+    const o = document.createElement('option');
+    o.value = m; o.textContent = m;
+    sel.appendChild(o);
+  }
+  sel.value = cur;
+}
+
+$('modelSelect').addEventListener('change', e => {
+  settings.models[settings.provider] = e.target.value;
+  persist();
+});
+
+function render(typing = false) {
+  const box = $('messages');
+  box.innerHTML = '';
+  if (history.length === 0 && !typing) {
+    const e = document.createElement('div');
+    e.className = 'empty';
+    e.textContent = 'Say hello to start the conversation.';
+    box.appendChild(e);
+  }
+  for (const m of history) {
+    const d = document.createElement('div');
+    d.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
+    d.textContent = m.content;
+    box.appendChild(d);
+  }
+  if (typing) {
+    const t = document.createElement('div');
+    t.className = 'typing';
+    t.textContent = 'Thinking…';
+    box.appendChild(t);
+  }
+  for (const n of infos) {
+    const d = document.createElement('div');
+    d.className = 'info';
+    d.textContent = n;
+    box.appendChild(d);
+  }
+  for (const n of notices) {
+    const d = document.createElement('div');
+    d.className = 'error';
+    d.textContent = n;
+    box.appendChild(d);
+  }
+  box.scrollTop = box.scrollHeight;
+}
+
+function updateSettingsUI() {
+  $('hint').innerHTML = HINTS[draftProvider];
+  $('refreshBtn').style.display = draftProvider === 'groq' ? '' : 'none';
+  $('apiKey').value = draftKeys[draftProvider] || '';
+}
+
+function openSettings(open = true) {
+  $('settings').classList.toggle('open', open);
+  if (open) {
+    draftKeys = Object.assign({}, settings.keys);
+    draftProvider = settings.provider;
+    $('provider').value = draftProvider;
+    $('system').value = settings.system;
+    updateSettingsUI();
+  }
+}
+
+$('settingsBtn').addEventListener('click', () => openSettings(!$('settings').classList.contains('open')));
+
+$('provider').addEventListener('change', () => {
+  draftKeys[draftProvider] = $('apiKey').value.trim();
+  draftProvider = $('provider').value;
+  updateSettingsUI();
+});
+
+$('saveBtn').addEventListener('click', () => {
+  draftKeys[draftProvider] = $('apiKey').value.trim();
+  settings.keys = Object.assign({}, settings.keys, draftKeys);
+  settings.provider = draftProvider;
+  settings.system = $('system').value.trim();
+  persist();
+  notices = []; infos = [];
+  openSettings(false);
+  fillModelSelect();
+  render();
+  // First time with a Groq key: pull the live model list automatically.
+  if (settings.provider === 'groq' && settings.keys.groq && !settings.lists.groq) refreshGroqModels(true);
+});
+
+async function refreshGroqModels(silent = false) {
+  const key = ($('settings').classList.contains('open') && draftProvider === 'groq')
+    ? ($('apiKey').value.trim() || settings.keys.groq)
+    : settings.keys.groq;
+  if (!key) { notices = ['Paste your Groq API key first.']; render(); return; }
+  $('refreshBtn').disabled = true;
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/models', { headers: { Authorization: 'Bearer ' + key } });
+    const data = await parseOrThrow(res);
+    const ids = (data.data || []).map(m => m.id)
+      .filter(id => !/whisper|tts|guard|orpheus|playai|safeguard|embed/i.test(id))
+      .sort();
+    if (!ids.length) throw new Error('No chat models were returned.');
+    settings.lists.groq = ids;
+    if (!ids.includes(settings.models.groq)) delete settings.models.groq;
+    persist();
+    if (settings.provider === 'groq') fillModelSelect();
+    notices = [];
+    infos = ['Loaded ' + ids.length + ' Groq models. Pick one from the dropdown at the top.'];
+  } catch (err) {
+    infos = [];
+    if (!silent) notices = [err instanceof TypeError ? 'Could not reach Groq. Open this file directly in your browser.' : 'Error: ' + err.message];
+  } finally {
+    $('refreshBtn').disabled = false;
+    render();
+  }
+}
+$('refreshBtn').addEventListener('click', () => refreshGroqModels(false));
+
+$('clearBtn').addEventListener('click', () => {
+  if (!confirm('Clear the whole conversation?')) return;
+  history = []; notices = []; infos = [];
+  saveHistory();
+  render();
+});
+
+function autosize() {
+  const t = $('input');
+  t.style.height = 'auto';
+  t.style.height = Math.min(t.scrollHeight, 160) + 'px';
+}
+$('input').addEventListener('input', autosize);
+
+$('input').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    $('form').requestSubmit();
+  }
+});
+
+async function parseOrThrow(res) {
+  let data = null;
+  try { data = await res.json(); } catch {}
+  if (!res.ok) {
+    throw new Error((data && data.error && data.error.message) || `Request failed (${res.status} ${res.statusText})`);
+  }
+  return data || {};
+}
+
+async function callProvider() {
+  const p = settings.provider;
+  const key = settings.keys[p];
+  const model = currentModel();
+
+  if (p === 'groq') {
+    const messages = [];
+    if (settings.system) messages.push({ role: 'system', content: settings.system });
+    messages.push(...history);
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', Authorization: 'Bearer ' + key },
+      body: JSON.stringify({ model, messages, max_tokens: 1024 })
+    });
+    const data = await parseOrThrow(res);
+    const reply = (((data.choices || [])[0] || {}).message || {}).content;
+    if (!reply) throw new Error('The model returned no text.');
+    return reply.trim();
+  }
+
+  if (p === 'anthropic') {
+    const body = { model, max_tokens: 1024, messages: history };
+    if (settings.system) body.system = settings.system;
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': key,
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true'
+      },
+      body: JSON.stringify(body)
+    });
+    const data = await parseOrThrow(res);
+    return (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+  }
+
+  // Gemini
+  const body = {
+    contents: history.map(m => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
+    generationConfig: { maxOutputTokens: 1024 }
+  };
+  if (settings.system) body.systemInstruction = { parts: [{ text: settings.system }] };
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
+    body: JSON.stringify(body)
+  });
+  const data = await parseOrThrow(res);
+  const cand = (data.candidates || [])[0];
+  const reply = ((cand && cand.content && cand.content.parts) || []).map(x => x.text || '').join('').trim();
+  if (!reply) {
+    const reason = (cand && cand.finishReason) || (data.promptFeedback && data.promptFeedback.blockReason) || 'no text returned';
+    throw new Error('The model returned no text (' + reason + ').');
+  }
+  return reply;
+}
+
+async function send(text) {
+  notices = []; infos = [];
+  history.push({ role: 'user', content: text });
+  saveHistory();
+  busy = true;
+  $('sendBtn').disabled = true;
+  render(true);
+
+  try {
+    const reply = await callProvider();
+    history.push({ role: 'assistant', content: reply || '(empty response)' });
+  } catch (err) {
+    history.pop();
+    $('input').value = text;
+    autosize();
+    const msg = err instanceof TypeError
+      ? 'Network error: the request was blocked or could not reach the API. If you are viewing this inside a preview pane, download the file and open it directly in Chrome, Edge, Firefox or Safari.'
+      : 'Error: ' + err.message;
+    notices = [msg];
+    if (/api key|auth|permission|invalid|401|403/i.test(msg)) openSettings(true);
+  } finally {
+    busy = false;
+    $('sendBtn').disabled = false;
+    saveHistory();
+    render();
+    $('input').focus();
+  }
+}
+
+$('form').addEventListener('submit', e => {
+  e.preventDefault();
+  if (busy) return;
+  const text = $('input').value.trim();
+  if (!text) return;
+  if (!settings.keys[settings.provider]) {
+    openSettings(true);
+    notices = ['Add your API key in Settings to start chatting.'];
+    render();
+    return;
+  }
+  $('input').value = '';
+  autosize();
+  send(text);
+});
+
+fillModelSelect();
+render();
+</script>
+</body>
+</html>
